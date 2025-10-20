@@ -1,0 +1,113 @@
+# =========================
+#  CRL FACTOR SELECTION — MASTER CONFIG
+#  (works with: run_experiments.py, crl_factor_bandit_conformal.py,
+#   baselines_crl.py, causal_effects.py, ope_dr.py, generate_report.py)
+# =========================
+
+# ---------- DATA / RUN ----------
+results_dir: results/cdi/crl
+panel_path: data/cdi_panel.parquet         # your processed panel file
+train_end:  "2023-12-31"
+test_start: "2024-01-01"
+seed: 23
+save_checkpoints: true
+
+# Horizons and factor definitions (used across CRL, baselines, causal, OPE)
+horizons: [10, 21, 42, 63]
+momentum_windows: [10, 21, 42, 63]
+
+# ---------- SCALING (single source of truth) ----------
+# Used by CRL logs, baselines logs, causal value function, OPE and report
+horizon_scale_mode: per_step               # {none, per_step, per_sqrt_time}
+
+# ---------- CONFORMAL / CALIBRATION ----------
+alpha: 0.10                                # nominal miscoverage (1 - coverage)
+# Optional per-h overrides (fallback to alpha if missing)
+alpha_5:  0.10
+alpha_21: 0.10
+alpha_63: 0.10
+
+conf_window: 250                           # size of conformal residual buffer
+lambda_recency: 0.0                        # 0 = uniform; >0 favors recent residuals
+calib_warmup_min: 20                       # residuals required before skipping clamp
+raw_min_width: 0.002                       # 20 bps minimum width during warm-up
+raw_max_width: 0.050                       # 5% maximum width during warm-up
+
+# (report-only rolling diagnostics; does not affect training)
+cov_window: 60
+lambda_cov: 0.0
+lambda_width: 0.0
+
+# ---------- PURGE / EMBARGO ----------
+# runner will apply max(this, h) where appropriate to avoid look-ahead
+max_purge_steps: 21
+
+# ---------- CRL HEADS (CQR quantile models) ----------
+# Quantile levels for the heads
+tau_low:  0.05
+tau_high: 0.95
+
+# Optimizer / regularization knobs (if your code reads them)
+eta_q: 0.02                                 # learning rate for quantile heads (if applicable)
+lam_head: 1.0e-4                            # L2 (if applicable)
+
+# ---------- BANDIT / POLICY ----------
+lam_bandit: 0.1                             # regularization for bandit (if applicable)
+epsilon_start: 0.05                         # optional exploration (if used)
+epsilon_end: 0.01
+epsilon_decay_steps: 100
+
+# ---------- BASELINES (leakage-safe, same evaluation protocol) ----------
+# "Traditional" single-momentum single-horizon baseline
+traditional_mom: mom_w21
+traditional_h:   21
+
+# "Best fixed" (picked ex-ante for illustration or from a separate CV)
+best_fixed_mom:  mom_w10
+best_fixed_h:    10
+
+# You can list multiple named baselines in your code; these keys are read to resolve defaults
+
+# ---------- CAUSAL (value function & counterfactuals) ----------
+# Pointwise: debenture-level OOF value, then aggregate per date (default in our patches)
+causal_value_pointwise: true
+value_scale: per_step                       # scales label for fair cross-h comparison
+
+# Cross-fitting
+n_splits_value: 3
+
+# Counterfactual fixed policies as yardsticks (evaluated on the same decision dates)
+cf_top_fraction: 0.20                       # top-20% selection alternative
+cf_min_selection: 5                         # minimum names per date to form a basket
+cf_h_mode: policy                           # {policy, fixed} — whether to keep CRL's h or enforce a fixed one
+cf_fixed_h: 21
+cf_return_scale: per_step                   # {per_step, raw} — how to scale returns for CF summaries
+cf_mbb_block: 5
+cf_mbb_B: 2000
+
+# ---------- OPE (DM / IPS / DR on returns) ----------
+n_splits_ope: 5
+# Q-model (DM) capacity (adjust to taste)
+q_n_trees: 600
+q_max_depth: 14
+q_min_leaf: 8
+# If your OPE code reads behavior support_size from Random logs,
+# no extra config is needed; reconstruction is automatic otherwise.
+
+# ---------- REPORT (uncertainty & figure knobs) ----------
+report:
+  nw_max_lags: 10                           # Newey–West max lag for time dependence
+  mbb_block: 20                             # Moving block bootstrap block size (dates)
+  mbb_B: 1000                               # Bootstrap replications
+  mbb_alpha: 0.10                           # 90% CI
+  use_scaled_metrics: true                  # prefer loss_scaled/width_scaled when present
+  figure_dpi: 120
+
+# ---------- FALSIFICATION (placebo label shifts) ----------
+placebo_shifts: [5, 21, 63]
+
+# ---------- MISC LOGGING / OUTPUT ----------
+write_per_security_csv: true                # security-level matured rows
+write_index_aggregates: true                # daily index-weighted aggregates
+write_calibrator_audit: true                # writes calibrator_audit*.csv
+verbosity: 0
