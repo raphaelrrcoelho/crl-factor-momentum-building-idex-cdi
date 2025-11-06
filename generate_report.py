@@ -386,6 +386,387 @@ def _mbb_mean_ci(series: np.ndarray, block: int = 20, B: int = 1000, alpha: floa
     hi = np.quantile(boot, 1 - alpha/2)
     return float(m), float(lo), float(hi)
 
+# ============================================================================
+# STATISTICAL TESTS ADDITIONS FOR generate_report.py
+# ============================================================================
+# Add these functions to your generate_report.py file
+#
+# These address issues #5, #11, #13, and #16 from the code review:
+# - Statistical significance test for 21.7% improvement
+# - Empirical coverage statistics
+# - Observation count verification
+# ============================================================================
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Tuple, Optional
+import json
+import os
+
+
+def diebold_mariano_test(series1: np.ndarray, series2: np.ndarray, 
+                         h: int = 1, max_lags: int = 10) -> Dict[str, float]:
+    """
+    Diebold-Mariano test for comparing two forecast methods.
+    Tests H0: Equal forecast accuracy vs H1: Different accuracy
+    
+    Parameters
+    ----------
+    series1 : np.ndarray
+        Loss series from method 1 (e.g., CRL)
+    series2 : np.ndarray
+        Loss series from method 2 (e.g., Best Fixed)
+    h : int
+        Forecast horizon (for small-sample adjustment)
+    max_lags : int
+        Maximum lags for Newey-West HAC covariance
+        
+    Returns
+    -------
+    dict with keys: diff_mean, dm_stat, p_value, nw_se
+    """
+    from scipy import stats
+    
+    # Difference in losses
+    d = series1 - series2
+    n = len(d)
+    
+    if n < 2:
+        return {"diff_mean": float(np.mean(d)), "dm_stat": np.nan, 
+                "p_value": np.nan, "nw_se": np.nan}
+    
+    # Mean difference
+    d_bar = np.mean(d)
+    
+    # Newey-West HAC standard error
+    d_centered = d - d_bar
+    gamma0 = np.dot(d_centered, d_centered) / n
+    var = gamma0
+    
+    for lag in range(1, min(max_lags, n-1) + 1):
+        gamma = np.dot(d_centered[lag:], d_centered[:-lag]) / n
+        weight = 1.0 - lag / (max_lags + 1.0)
+        var += 2.0 * weight * gamma
+    
+    # Small-sample adjustment for multi-step forecasts (Harvey et al. 1997)
+    adjustment = np.sqrt((n + 1 - 2*h + h*(h-1)/n) / n)
+    se = np.sqrt(var / n)
+    
+    # DM statistic
+    dm_stat = d_bar / (se * adjustment) if se > 0 else np.nan
+    
+    # Two-sided p-value (t-distribution with n-1 df)
+    if np.isfinite(dm_stat):
+        p_value = 2 * (1 - stats.t.cdf(abs(dm_stat), df=n-1))
+    else:
+        p_value = np.nan
+    
+    return {
+        "diff_mean": float(d_bar),
+        "dm_stat": float(dm_stat) if np.isfinite(dm_stat) else np.nan,
+        "p_value": float(p_value) if np.isfinite(p_value) else np.nan,
+        "nw_se": float(se) if np.isfinite(se) else np.nan,
+        "n_obs": int(n)
+    }
+
+
+def compute_statistical_significance(results_dir: str, 
+                                     crl_scores: pd.DataFrame,
+                                     baseline_scores: pd.DataFrame,
+                                     out_dir: str) -> Dict[str, any]:
+    """
+    Compute statistical significance of CRL vs baselines using Diebold-Mariano test.
+    Addresses Issue #11 from code review.
+    
+    Parameters
+    ----------
+    results_dir : str
+        Results directory
+    crl_scores : pd.DataFrame
+        CRL security-level scores with columns: date, h, loss_scaled
+    baseline_scores : pd.DataFrame
+        Baseline security-level scores with columns: date, h, baseline, loss_scaled
+    out_dir : str
+        Output directory for results
+        
+    Returns
+    -------
+    Dict with test results
+    """
+    if crl_scores is None or crl_scores.empty:
+        print("[STAT] No CRL scores available")
+        return {}
+    
+    if baseline_scores is None or baseline_scores.empty:
+        print("[STAT] No baseline scores available")
+        return {}
+    
+    # Aggregate to date level (average across horizons)
+    crl_daily = (crl_scores.groupby("date")["loss_scaled"]
+                           .mean()
+                           .sort_index()
+                           .rename("crl_loss"))
+    
+    results = []
+    
+    # Test against each baseline
+    for baseline_name, g in baseline_scores.groupby("baseline"):
+        baseline_daily = (g.groupby("date")["loss_scaled"]
+                          .mean()
+                          .sort_index()
+                          .rename(f"{baseline_name}_loss"))
+        
+        # Merge on common dates
+        merged = pd.concat([crl_daily, baseline_daily], axis=1).dropna()
+        
+        if len(merged) < 10:
+            print(f"[STAT] Insufficient data for {baseline_name}: {len(merged)} observations")
+            continue
+        
+        # Run Diebold-Mariano test
+        dm_result = diebold_mariano_test(
+            merged["crl_loss"].values,
+            merged[f"{baseline_name}_loss"].values,
+            h=1,  # Daily predictions
+            max_lags=10
+        )
+        
+        # Calculate improvement percentage
+        crl_mean = merged["crl_loss"].mean()
+        baseline_mean = merged[f"{baseline_name}_loss"].mean()
+        improvement_pct = (baseline_mean - crl_mean) / baseline_mean * 100
+        
+        results.append({
+            "baseline": baseline_name,
+            "crl_loss": float(crl_mean),
+            "baseline_loss": float(baseline_mean),
+            "improvement_pct": float(improvement_pct),
+            "dm_statistic": dm_result["dm_stat"],
+            "p_value": dm_result["p_value"],
+            "nw_se": dm_result["nw_se"],
+            "n_dates": dm_result["n_obs"],
+            "significant_5pct": dm_result["p_value"] < 0.05 if np.isfinite(dm_result["p_value"]) else False,
+            "significant_1pct": dm_result["p_value"] < 0.01 if np.isfinite(dm_result["p_value"]) else False,
+        })
+    
+    if results:
+        results_df = pd.DataFrame(results)
+        results_df.to_csv(os.path.join(out_dir, "statistical_significance.csv"), index=False)
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("STATISTICAL SIGNIFICANCE TESTS (Diebold-Mariano)")
+        print("="*70)
+        for _, row in results_df.iterrows():
+            sig_marker = "***" if row["significant_1pct"] else ("**" if row["significant_5pct"] else "")
+            print(f"\nCRL vs {row['baseline']}:")
+            print(f"  Improvement: {row['improvement_pct']:.2f}% {sig_marker}")
+            print(f"  DM statistic: {row['dm_statistic']:.3f}")
+            print(f"  p-value: {row['p_value']:.4f}")
+            print(f"  CRL loss: {row['crl_loss']:.6f}")
+            print(f"  {row['baseline']} loss: {row['baseline_loss']:.6f}")
+        print("="*70)
+        print("** = significant at 5% level, *** = significant at 1% level")
+        print("="*70 + "\n")
+    
+    return {"results": results, "results_df": results_df if results else None}
+
+
+def compute_coverage_statistics(results_dir: str, 
+                                crl_scores: pd.DataFrame,
+                                out_dir: str,
+                                nominal_coverage: float = 0.90) -> Dict:
+    """
+    Compute comprehensive coverage statistics.
+    Addresses Issues #5 and #16 from code review.
+    
+    Parameters
+    ----------
+    results_dir : str
+        Results directory
+    crl_scores : pd.DataFrame
+        CRL security-level scores with columns: date, h, covered
+    out_dir : str
+        Output directory
+    nominal_coverage : float
+        Nominal coverage level (default 0.90 for alpha=0.10)
+        
+    Returns
+    -------
+    Dict with coverage statistics
+    """
+    if crl_scores is None or crl_scores.empty or "covered" not in crl_scores.columns:
+        print("[COV] No coverage data available")
+        return {}
+    
+    # Overall coverage
+    overall_cov = crl_scores["covered"].mean()
+    
+    # Coverage by horizon
+    by_horizon = (crl_scores.groupby("h")
+                            .agg(
+                                coverage=("covered", "mean"),
+                                n_predictions=("covered", "count"),
+                                min_coverage=("covered", lambda x: x.min()),
+                                max_coverage=("covered", lambda x: x.max())
+                            )
+                            .reset_index())
+    
+    # Coverage over time (rolling 60-day window)
+    crl_daily = (crl_scores.groupby("date")
+                           .agg(coverage=("covered", "mean"))
+                           .sort_index())
+    
+    rolling_cov = crl_daily["coverage"].rolling(window=60, min_periods=10).mean()
+    
+    # Coverage distribution (histogram bins)
+    cov_by_date = crl_scores.groupby("date")["covered"].mean()
+    hist, bins = np.histogram(cov_by_date.values, bins=20, range=(0, 1))
+    
+    # Statistical test: Is coverage significantly different from nominal?
+    from scipy import stats
+    n = len(cov_by_date)
+    coverage_test = stats.binom_test(
+        int(overall_cov * len(crl_scores)),
+        len(crl_scores),
+        nominal_coverage,
+        alternative='two-sided'
+    )
+    
+    results = {
+        "overall_coverage": float(overall_cov),
+        "nominal_coverage": float(nominal_coverage),
+        "coverage_deviation": float(overall_cov - nominal_coverage),
+        "coverage_deviation_pct": float((overall_cov - nominal_coverage) / nominal_coverage * 100),
+        "p_value_coverage_test": float(coverage_test),
+        "n_predictions": int(len(crl_scores)),
+        "by_horizon": by_horizon.to_dict('records'),
+        "min_date_coverage": float(cov_by_date.min()),
+        "max_date_coverage": float(cov_by_date.max()),
+        "std_date_coverage": float(cov_by_date.std()),
+    }
+    
+    # Save results
+    with open(os.path.join(out_dir, "coverage_statistics.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    
+    by_horizon.to_csv(os.path.join(out_dir, "coverage_by_horizon.csv"), index=False)
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("COVERAGE STATISTICS")
+    print("="*70)
+    print(f"Overall coverage: {overall_cov:.3f} (nominal: {nominal_coverage:.3f})")
+    print(f"Deviation: {results['coverage_deviation']:.3f} ({results['coverage_deviation_pct']:.2f}%)")
+    print(f"Coverage test p-value: {coverage_test:.4f}")
+    print(f"\nCoverage by horizon:")
+    print(by_horizon.to_string(index=False))
+    print(f"\nDate-level coverage range: [{results['min_date_coverage']:.3f}, {results['max_date_coverage']:.3f}]")
+    print(f"Date-level coverage std: {results['std_date_coverage']:.3f}")
+    print("="*70 + "\n")
+    
+    return results
+
+
+def verify_observation_counts(results_dir: str,
+                              crl_scores: pd.DataFrame,
+                              out_dir: str) -> Dict:
+    """
+    Verify and report observation counts.
+    Addresses Issue #13 from code review.
+    
+    Parameters
+    ----------
+    results_dir : str
+        Results directory
+    crl_scores : pd.DataFrame
+        CRL security-level scores
+    out_dir : str
+        Output directory
+        
+    Returns
+    -------
+    Dict with observation statistics
+    """
+    if crl_scores is None or crl_scores.empty:
+        print("[OBS] No data available")
+        return {}
+    
+    # Basic counts
+    n_total = len(crl_scores)
+    n_securities = crl_scores["id"].nunique()
+    n_dates = crl_scores["date"].nunique()
+    avg_per_security = n_total / n_securities if n_securities > 0 else 0
+    avg_per_date = n_total / n_dates if n_dates > 0 else 0
+    
+    # By horizon
+    by_horizon = (crl_scores.groupby("h")
+                            .agg(
+                                n_predictions=("id", "count"),
+                                n_securities=("id", "nunique"),
+                                n_dates=("date", "nunique")
+                            )
+                            .reset_index())
+    
+    # Date range
+    date_min = crl_scores["date"].min()
+    date_max = crl_scores["date"].max()
+    
+    # Securities with predictions
+    securities_by_count = (crl_scores.groupby("id")
+                                     .size()
+                                     .describe())
+    
+    results = {
+        "total_predictions": int(n_total),
+        "unique_securities": int(n_securities),
+        "unique_dates": int(n_dates),
+        "avg_predictions_per_security": float(avg_per_security),
+        "avg_predictions_per_date": float(avg_per_date),
+        "date_range": {
+            "start": str(date_min.date()) if hasattr(date_min, 'date') else str(date_min),
+            "end": str(date_max.date()) if hasattr(date_max, 'date') else str(date_max)
+        },
+        "by_horizon": by_horizon.to_dict('records'),
+        "predictions_per_security": {
+            "min": int(securities_by_count["min"]),
+            "25pct": int(securities_by_count["25%"]),
+            "median": int(securities_by_count["50%"]),
+            "75pct": int(securities_by_count["75%"]),
+            "max": int(securities_by_count["max"]),
+            "mean": float(securities_by_count["mean"]),
+            "std": float(securities_by_count["std"])
+        }
+    }
+    
+    # Save results
+    with open(os.path.join(out_dir, "observation_counts.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    
+    by_horizon.to_csv(os.path.join(out_dir, "observations_by_horizon.csv"), index=False)
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("OBSERVATION COUNT VERIFICATION")
+    print("="*70)
+    print(f"Total predictions: {n_total:,}")
+    print(f"Unique securities: {n_securities}")
+    print(f"Unique dates: {n_dates}")
+    print(f"Average predictions per security: {avg_per_security:.1f}")
+    print(f"Average predictions per date: {avg_per_date:.1f}")
+    print(f"Date range: {results['date_range']['start']} to {results['date_range']['end']}")
+    print(f"\nPredictions per security distribution:")
+    print(f"  Min: {results['predictions_per_security']['min']}")
+    print(f"  Median: {results['predictions_per_security']['median']}")
+    print(f"  Max: {results['predictions_per_security']['max']}")
+    print(f"  Mean: {results['predictions_per_security']['mean']:.1f}")
+    print(f"\nBy horizon:")
+    print(by_horizon.to_string(index=False))
+    print("="*70 + "\n")
+    
+    return results
+
+
 def _build_performance_table(results_dir: str, out_dir: str, panel_path: str
                              ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
@@ -855,6 +1236,19 @@ def generate_full_report(results_dir: str, out_dir: Optional[str] = None):
 
     # 1b) Detailed baseline analysis (heatmap + comparison)
     _baseline_analysis(results_dir, out_dir, perf)
+
+    # 1c) Statistical significance tests
+    all_base = _read_csv_safe(os.path.join(results_dir, "all_baseline_scores_securities.csv"), parse_dates=["date"])
+    if perf is not None and crl_sec is not None and all_base is not None:
+        compute_statistical_significance(results_dir, crl_sec, all_base, out_dir)
+
+    # 1d) Coverage statistics  
+    if crl_sec is not None:
+        compute_coverage_statistics(results_dir, crl_sec, out_dir, nominal_coverage=0.90)
+
+    # 1e) Observation count verification
+    if crl_sec is not None:
+        verify_observation_counts(results_dir, crl_sec, out_dir)
 
     # 2) Horizon table + core time-series & calibration diagnostics
     byh = _build_by_horizon_table(crl_idx, out_dir)

@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -88,16 +89,12 @@ def cfg_get(obj: Any, key: str | tuple | list, default=None):
 
 # ----------------------------- Value function (OOF) ----------------------------- #
 
-from ablation_study import _newey_west_se, _mbb_mean_ci  # reuse your HAC & block bootstrap
-from crl_factor_bandit_conformal import load_panel      # same loader as training
-
 def compute_learned_policy_from_security_logs(results_dir: str,
                                               panel_path: str,
                                               scale: str = "per_step") -> Dict[str, Any]:
     """
     Read <results_dir>/crl_scores_securities.csv and compute index-weighted
     per-date returns of the *actual* CRL actions, by horizon and overall.
-
     scale ∈ {"raw","per_step"}: report mean returns either raw or divided by h.
     """
     path = os.path.join(results_dir, "crl_scores_securities.csv")
@@ -166,48 +163,73 @@ def _build_pointwise_for_value(df: pd.DataFrame, choices: pd.DataFrame, h: int, 
     index weights normalized within each date.
     """
     ch = choices[["date", "momentum", "h"]].drop_duplicates().rename(columns={"momentum": "mom_sel", "h": "h_sel"})
-    # Use context features (not momentum signals) for heterogeneity analysis
-    context_feats = ["ret_vol20_z", "idx_vol_z", "spread_z", "duration_z", "ret_autocorr_z",
-                     "spread_percentile", "vol_percentile"]
-    keep_cols = [c for c in context_feats if c in df.columns]
-    base_cols = [DATE_COL, ID_COL, f"y_h{h}", "index_weight"] + keep_cols + ["mom_w5_z","mom_w10_z","mom_w21_z","mom_w42_z"]
-    df_h = df[df.columns.intersection(base_cols)].copy()
+    df_h = df[df.columns.intersection(
+        [DATE_COL, ID_COL, f"y_h{h}", "index_weight"] + [c for c in df.columns if c.startswith("mom_")]
+    )].copy()
     df_h = df_h.merge(ch, on="date", how="inner")
-    rows = []
-    for d, day in df_h.groupby(DATE_COL, sort=True):
+
+    # ensure selection momentum exists
+    colz = df_h["mom_sel"].astype(str) + "_z"
+    mask = colz.isin(df_h.columns)
+    if not mask.all():
+        colr = df_h["mom_sel"].astype(str)
+        mask2 = colr.isin(df_h.columns)
+        df_h.loc[~mask & mask2, "mom_sel"] = df_h.loc[~mask & mask2, "mom_sel"]
+
+    # Features for heterogeneity (context, not momentum itself)
+    feats = ["ret_vol20_z", "idx_vol_z", "spread_z", "duration_z", "ret_autocorr_z",
+             "spread_percentile", "vol_percentile", "index_weight"]
+    feats = [f for f in feats if f in df_h.columns]
+
+    X_list, y_list, date_list, w_list = [], [], [], []
+    
+    for d, day in df_h.groupby(DATE_COL):
         if day.empty or f"y_h{h}" not in day.columns:
             continue
         mname = str(day["mom_sel"].iloc[0])
         mcol = f"{mname}_z" if f"{mname}_z" in day.columns else mname
         if mcol not in day.columns:
             continue
-        # Pre-drop NaNs
-        dd = day.dropna(subset=[mcol, f"y_h{h}", "index_weight"]).copy()
-        if dd.empty:
-            continue
-        thr = float(dd[mcol].quantile(1.0 - float(top_frac)))
-        sel = dd.loc[dd[mcol] >= thr].copy()
+
+        q = 1.0 - float(top_frac)
+        thr = day[mcol].quantile(q)
+        sel = day[day[mcol] >= thr]
+
+        # NaN-safe selection
+        sel = sel.dropna(subset=[f"y_h{h}", "index_weight"] + feats)
         if sel.empty:
             continue
-        # Normalize weights within date
-        w = sel["index_weight"].to_numpy(dtype=np.float32)
-        w = w / (w.sum() + 1e-12)
-        X = sel[[c for c in keep_cols if c in sel.columns]].astype("float32").to_numpy()
-        y = sel[f"y_h{h}"].astype("float32").to_numpy()
-        dates = pd.Series(pd.to_datetime(d)).repeat(len(sel)).reset_index(drop=True)
-        rows.append((X, y, w, dates))
-    if not rows:
-        return np.empty((0,0), dtype=np.float32), np.empty((0,), dtype=np.float32), pd.Series([], dtype='datetime64[ns]'), np.empty((0,), dtype=np.float32)
-    X = np.vstack([r[0] for r in rows]).astype(np.float32)
-    y = np.concatenate([r[1] for r in rows]).astype(np.float32)
-    w = np.concatenate([r[2] for r in rows]).astype(np.float32)
-    dates = pd.concat([r[3] for r in rows], ignore_index=True)
-    ok = np.isfinite(y) & np.isfinite(w) & np.all(np.isfinite(X), axis=1)
-    return X[ok], y[ok], dates[ok], w[ok]
 
-def _build_Xy_for_value(df: pd.DataFrame, choices: pd.DataFrame, h: int) -> Tuple[np.ndarray, np.ndarray, pd.Series]:
+        w = sel["index_weight"].to_numpy(dtype=np.float32)
+        w_norm = w / (w.sum() + 1e-12)
+        y_vals = sel[f"y_h{h}"].to_numpy(dtype=np.float32)
+        X_vals = sel[feats].to_numpy(dtype=np.float32)
+
+        if not (np.isfinite(y_vals).all() and np.isfinite(X_vals).all() and np.isfinite(w_norm).all()):
+            continue
+
+        X_list.append(X_vals)
+        y_list.append(y_vals)
+        w_list.append(w_norm)
+        date_list.extend([d] * len(sel))
+
+    if not X_list:
+        return (np.empty((0, len(feats)), dtype=np.float32), 
+                np.empty((0,), dtype=np.float32), 
+                pd.Series([], dtype="datetime64[ns]"),
+                np.empty((0,), dtype=np.float32))
+
+    X = np.vstack(X_list).astype(np.float32)
+    y = np.concatenate(y_list).astype(np.float32)
+    w = np.concatenate(w_list).astype(np.float32)
+    dates = pd.Series(date_list, dtype="datetime64[ns]")
+    
+    return X, y, dates, w
+
+
+def _build_Xy_for_value(df: pd.DataFrame, choices: pd.DataFrame, h: int):
     """
-    Build X, y for value function at horizon h on the *policy decision dates*.
+    Build (X, y, dates) for horizon h at the DATE level (legacy mode).
     Aggregates selected securities to a single index-weighted target per date.
     NaN-safe: drops rows missing y_h or index_weight before aggregation.
     """
@@ -268,6 +290,7 @@ def _build_Xy_for_value(df: pd.DataFrame, choices: pd.DataFrame, h: int) -> Tupl
     X = np.vstack(X_list).astype(np.float32)
     y = np.asarray(y_list, dtype=np.float32)
     return X, y, dates.reset_index(drop=True)
+
 
 def estimate_policy_value_function(df: pd.DataFrame,
                                    policy_choices: pd.DataFrame,
@@ -371,17 +394,7 @@ def estimate_policy_value_function(df: pd.DataFrame,
     return out
 
 
-# ----------------------------- CATE on extremes ----------------------------- #
-
-from dataclasses import dataclass
-
-@dataclass
-class CATEOut:
-    df_oof: pd.DataFrame
-    summary: Dict[str, float]
-
-# (rest of your original CATE and counterfactual code remains unchanged,
-# except for a NaN-safe helper below.)
+# ----------------------------- Counterfactual fixed policies ----------------------------- #
 
 def _pick_momentum_columns(mom_cols: List[str]) -> Dict[str, Optional[str]]:
     """
@@ -405,7 +418,6 @@ def _pick_momentum_columns(mom_cols: List[str]) -> Dict[str, Optional[str]]:
         "always_long": _closest(42),
     }
 
-import re
 
 def _index_weighted_forward_return(day: pd.DataFrame,
                                    mom_for_selection: str,
@@ -441,7 +453,6 @@ def _index_weighted_forward_return(day: pd.DataFrame,
     val = float(np.sum(w * y))
     return val if np.isfinite(val) else None
 
-# (counterfactual computation, metrics, and validate_causal_learning kept as in your original)
 
 def compute_counterfactual_outcomes(df: pd.DataFrame,
                                     policy_choices: pd.DataFrame,
@@ -481,7 +492,7 @@ def compute_counterfactual_outcomes(df: pd.DataFrame,
     def _metrics_from(vals: List[float]) -> Dict[str, Any]:
         if not vals:
             return {}
-        arr = np.asarray(vals, dtype=float)
+        arr = np.asarray(vals, dtype=np.float32)
         if arr.size == 0:
             return {}
         nw = _newey_west_se(arr)
@@ -532,6 +543,7 @@ def compute_counterfactual_outcomes(df: pd.DataFrame,
 
     return results
 
+
 # ----------------------------- Causal diagnostic ----------------------------- #
 
 def validate_causal_learning(df: pd.DataFrame, choices: pd.DataFrame, cfg: Any) -> Dict[str, Any]:
@@ -577,6 +589,7 @@ def validate_causal_learning(df: pd.DataFrame, choices: pd.DataFrame, cfg: Any) 
             "n": int(len(common)),
         }
     return res
+
 
 # ----------------------------- Orchestration ----------------------------- #
 
