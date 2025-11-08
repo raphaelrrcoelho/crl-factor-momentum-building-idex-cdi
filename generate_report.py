@@ -39,9 +39,9 @@ Outputs under <results_dir>/report/:
 
 Design decisions
 - Start from SECURITY‑LEVEL predictions produced by CRL and baselines, aggregate to index
-  for time‑series figures / performance summaries. Uses the same panel loader as CRL. :contentReference[oaicite:3]{index=3}
-- Keeps `generate_full_report(results_dir, out_dir)` for pipeline compatibility. :contentReference[oaicite:4]{index=4}
-- Reads ablation outputs created by the new ablation module. :contentReference[oaicite:5]{index=5}
+  for time‑series figures / performance summaries. Uses the same panel loader as CRL.
+- Keeps `generate_full_report(results_dir, out_dir)` for pipeline compatibility.
+- Reads ablation outputs created by the new ablation module.
 """
 
 from __future__ import annotations
@@ -58,6 +58,10 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from crl_factor_bandit_conformal import (
+    load_panel
+)
 
 
 # ============================= Generic IO helpers ============================= #
@@ -93,7 +97,7 @@ def _maybe_float(x, default=np.nan):
 def _resolve_panel_path(results_dir: str) -> str:
     """
     Locate panel path via <results_dir>/config_resolved.yaml, fallback to default.
-    Mirrors the logic used in OPE to stay consistent with training. :contentReference[oaicite:6]{index=6}
+    Mirrors the logic used in OPE to stay consistent with training.
     """
     cfg_path = os.path.join(results_dir, "config_resolved.yaml")
     if os.path.exists(cfg_path):
@@ -123,14 +127,14 @@ def _resolve_panel_path(results_dir: str) -> str:
 def _aggregate_security_to_index(df_sec: pd.DataFrame, panel_path: str) -> pd.DataFrame:
     """
     Aggregate security-level predictions to index level using the **same** panel weights
-    used by the CRL runner (load_panel). :contentReference[oaicite:7]{index=7}
+    used by the CRL runner (load_panel).
     """
     if df_sec is None or df_sec.empty:
         return pd.DataFrame()
 
     # Merge weights from the original panel
     try:
-        from crl_factor_bandit_conformal import load_panel   # same loader as training :contentReference[oaicite:8]{index=8}
+        from crl_factor_bandit_conformal import load_panel   # same loader as training
         panel = load_panel(panel_path)
         w = panel[["date", "id", "index_weight"]].drop_duplicates()
         dfw = df_sec.merge(w, on=["date", "id"], how="left")
@@ -473,7 +477,8 @@ def diebold_mariano_test(series1: np.ndarray, series2: np.ndarray,
 def compute_statistical_significance(results_dir: str, 
                                      crl_scores: pd.DataFrame,
                                      baseline_scores: pd.DataFrame,
-                                     out_dir: str) -> Dict[str, any]:
+                                     out_dir: str,
+                                     panel_path: str) -> Dict[str, any]:
     """
     Compute statistical significance of CRL vs baselines using Diebold-Mariano test.
     Addresses Issue #11 from code review.
@@ -501,11 +506,30 @@ def compute_statistical_significance(results_dir: str,
         print("[STAT] No baseline scores available")
         return {}
     
-    # Aggregate to date level (average across horizons)
-    crl_daily = (crl_scores.groupby("date")["loss_scaled"]
-                           .mean()
-                           .sort_index()
-                           .rename("crl_loss"))
+    # Aggregate to date level using INDEX WEIGHTING (match performance table)
+    # First aggregate security → index (weighted), then to date
+    crl_sec = crl_scores.copy()
+    if "index_weight" not in crl_sec.columns:
+        # Load panel for weights
+        panel = load_panel(panel_path)
+        if isinstance(panel.index, pd.MultiIndex):
+            panel = panel.reset_index()
+        crl_sec = crl_sec.merge(
+            panel[["date", "id", "index_weight"]].drop_duplicates(),
+            on=["date", "id"],
+            how="left"
+        )
+        crl_sec["index_weight"] = crl_sec["index_weight"].fillna(1.0)
+
+    # Normalize weights per (date, h)
+    crl_sec["w_norm"] = crl_sec.groupby(["date", "h"])["index_weight"].transform(
+        lambda x: x / (x.sum() + 1e-12)
+    )
+
+    # Index-weighted aggregation per date
+    crl_daily = (crl_sec.groupby("date")
+                        .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
+                        .rename("crl_loss"))
     
     results = []
     
@@ -626,7 +650,7 @@ def compute_coverage_statistics(results_dir: str,
     # Statistical test: Is coverage significantly different from nominal?
     from scipy import stats
     n = len(cov_by_date)
-    coverage_test = stats.binom_test(
+    coverage_test = stats.binomtest(
         int(overall_cov * len(crl_scores)),
         len(crl_scores),
         nominal_coverage,
@@ -638,7 +662,7 @@ def compute_coverage_statistics(results_dir: str,
         "nominal_coverage": float(nominal_coverage),
         "coverage_deviation": float(overall_cov - nominal_coverage),
         "coverage_deviation_pct": float((overall_cov - nominal_coverage) / nominal_coverage * 100),
-        "p_value_coverage_test": float(coverage_test),
+        "coverage_test": str(coverage_test),
         "n_predictions": int(len(crl_scores)),
         "by_horizon": by_horizon.to_dict('records'),
         "min_date_coverage": float(cov_by_date.min()),
@@ -658,7 +682,7 @@ def compute_coverage_statistics(results_dir: str,
     print("="*70)
     print(f"Overall coverage: {overall_cov:.3f} (nominal: {nominal_coverage:.3f})")
     print(f"Deviation: {results['coverage_deviation']:.3f} ({results['coverage_deviation_pct']:.2f}%)")
-    print(f"Coverage test p-value: {coverage_test:.4f}")
+    print(f"Coverage test: {coverage_test}")
     print(f"\nCoverage by horizon:")
     print(by_horizon.to_string(index=False))
     print(f"\nDate-level coverage range: [{results['min_date_coverage']:.3f}, {results['max_date_coverage']:.3f}]")
@@ -986,14 +1010,14 @@ def _policy_evolution(results_dir: str, out_dir: str):
 def _policy_interpretation(results_dir: str, out_dir: str, scores_sec: Optional[pd.DataFrame]):
     """
     Group choices by volatility regimes → selection probability for short momentum.
-    (Keeps same output contract as the previous module version.) :contentReference[oaicite:11]{index=11}
+    (Keeps same output contract as the previous module version.)
     """
     choices = _read_csv_safe(os.path.join(results_dir, "crl_policy_choices.csv"), parse_dates=["date"])
     if choices is None or choices.empty:
         return
     df = choices.copy()
 
-    # Preferred: if CRL logged ctx volatility, use it (CRL runner writes ctx_retvol20 / idx_vol). :contentReference[oaicite:12]{index=12}
+    # Preferred: if CRL logged ctx volatility, use it (CRL runner writes ctx_retvol20 / idx_vol).
     def _tertiles(x: pd.Series):
         z = x.dropna().values
         return (np.quantile(z, 1/3), np.quantile(z, 2/3)) if z.size else (0.0, 0.0)
@@ -1003,7 +1027,7 @@ def _policy_interpretation(results_dir: str, out_dir: str, scores_sec: Optional[
         lo, hi = _tertiles(df["ctx_retvol20"])
         reg = df["ctx_retvol20"].apply(lambda v: "Low" if v < lo else ("Mid" if v < hi else "High"))
     elif scores_sec is not None and not scores_sec.empty and {"date","y"}.issubset(scores_sec.columns):
-        # Fallback: build a 60d rolling vol from the index‑level realized return (aggregated from y) :contentReference[oaicite:13]{index=13}
+        # Fallback: build a 60d rolling vol from the index‑level realized return (aggregated from y)
         panel_path = _resolve_panel_path(results_dir)
         idx = _aggregate_security_to_index(scores_sec, panel_path)[["date","y"]].dropna().sort_values("date")
         idx["ret_vol"] = idx["y"].rolling(60, min_periods=10).std()
@@ -1035,7 +1059,7 @@ def _policy_interpretation(results_dir: str, out_dir: str, scores_sec: Optional[
 def _plot_ope(results_dir: str, out_dir: str):
     """
     Plot DR risk for learned policy and baselines if OPE summary exists.
-    (Reads the CSV produced by the OPE step.) :contentReference[oaicite:14]{index=14}
+    (Reads the CSV produced by the OPE step.)
     """
     ope = _read_csv_safe(os.path.join(results_dir, "ope_dr_summary.csv"))
     if ope is None or ope.empty or not set(["policy","DR_risk"]).issubset(ope.columns):
@@ -1053,7 +1077,7 @@ def _plot_ope(results_dir: str, out_dir: str):
 
 def _plot_causal(results_dir: str, out_dir: str):
     """
-    Plot learned vs counterfactual fixed policies (from causal_effects_summary.csv). :contentReference[oaicite:15]{index=15}
+    Plot learned vs counterfactual fixed policies (from causal_effects_summary.csv).
     """
     path = os.path.join(results_dir, "causal_effects_summary.csv")
     df = _read_csv_safe(path)
@@ -1073,7 +1097,7 @@ def _plot_causal(results_dir: str, out_dir: str):
 def _plot_ablation(results_dir: str, out_dir: str):
     """
     Read ablation/overview.csv and visualize Δ loss vs BASE (overall and by horizon).
-    (Matches the artifacts produced by the upgraded ablation module.) :contentReference[oaicite:16]{index=16}
+    (Matches the artifacts produced by the upgraded ablation module.)
     """
     abl_dir = os.path.join(results_dir, "ablation")
     over = _read_csv_safe(os.path.join(abl_dir, "overview.csv"))
@@ -1127,7 +1151,7 @@ def _copy_falsification(results_dir: str, out_dir: str):
 
 def _load_analysis_meta(results_dir: str) -> dict:
     """
-    Pulls high‑level numbers from analysis.json produced by the CRL runner. :contentReference[oaicite:17]{index=17}
+    Pulls high‑level numbers from analysis.json produced by the CRL runner.
     """
     path = os.path.join(results_dir, "analysis.json")
     if not os.path.exists(path): return {}
@@ -1151,17 +1175,17 @@ def _chapter5_markdown(results_dir: str,
     md.append(f"**Experiment folder:** `{os.path.abspath(results_dir)}`\n")
 
     # Data snapshot
-    if meta:
-        n_rows = meta.get("n_security_predictions")
-        n_ids  = meta.get("n_unique_securities")
-        n_dt   = meta.get("n_unique_dates")
-        md.append("## 5.1 Data snapshot")
-        md.append(f"- Security–date observations: **{n_rows:,}**")
-        md.append(f"- Unique securities: **{n_ids:,}**")
-        md.append(f"- Unique dates: **{n_dt:,}**")
-        if "horizons" in meta:
-            md.append(f"- Horizons: **{', '.join(map(str, meta['horizons']))}**")
-        md.append("")
+    # if meta:
+    #     n_rows = meta.get("n_security_predictions")
+    #     n_ids  = meta.get("n_unique_securities")
+    #     n_dt   = meta.get("n_unique_dates")
+    #     md.append("## 5.1 Data snapshot")
+    #     md.append(f"- Security–date observations: **{n_rows:,}**")
+    #     md.append(f"- Unique securities: **{n_ids:,}**")
+    #     md.append(f"- Unique dates: **{n_dt:,}**")
+    #     if "horizons" in meta:
+    #         md.append(f"- Horizons: **{', '.join(map(str, meta['horizons']))}**")
+    #     md.append("")
 
     # Predictive interval quality
     md.append("## 5.2 Predictive interval quality")
@@ -1195,15 +1219,15 @@ def _chapter5_markdown(results_dir: str,
 
     # Causal & Counterfactuals
     md.append("\n## 5.6 Causal tests and counterfactuals")
-    md.append("- *Figure*: `causal_comparison.png` compares the learned policy to fixed momentum policies on the **same decision dates**. :contentReference[oaicite:19]{index=19}")
+    md.append("- *Figure*: `causal_comparison.png` compares the learned policy to fixed momentum policies on the **same decision dates**.")
 
     # Ablations
     md.append("\n## 5.7 Ablation study")
-    md.append("- *Figures*: `ablation_overview.png` and `ablation_by_h.png` summarize Δ loss vs BASE with bootstrap CIs, overall and by horizon. :contentReference[oaicite:20]{index=20}")
+    md.append("- *Figures*: `ablation_overview.png` and `ablation_by_h.png` summarize Δ loss vs BASE with bootstrap CIs, overall and by horizon.")
 
     # Falsification
     md.append("\n## 5.8 Falsification checks")
-    md.append("- See `falsification.json` (copied into `report/`) for placebo coverage and per‑horizon realized coverage. :contentReference[oaicite:21]{index=21}")
+    md.append("- See `falsification.json` (copied into `report/`) for placebo coverage and per‑horizon realized coverage.")
 
     # Append overview table
     if perf is not None and not perf.empty:
@@ -1240,7 +1264,7 @@ def generate_full_report(results_dir: str, out_dir: Optional[str] = None):
     # 1c) Statistical significance tests
     all_base = _read_csv_safe(os.path.join(results_dir, "all_baseline_scores_securities.csv"), parse_dates=["date"])
     if perf is not None and crl_sec is not None and all_base is not None:
-        compute_statistical_significance(results_dir, crl_sec, all_base, out_dir)
+        compute_statistical_significance(results_dir, crl_sec, all_base, out_dir, panel_path)
 
     # 1d) Coverage statistics  
     if crl_sec is not None:

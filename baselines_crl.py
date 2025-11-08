@@ -489,23 +489,50 @@ def run_all_baselines(
         summary = pd.DataFrame(columns=["baseline","mean_loss","cov_rate","mean_width",
                                         "mean_loss_scaled","mean_width_scaled","n_predictions"])
     else:
+        # Load panel for index weights
+        panel = load_panel(panel_path)
+        if isinstance(panel.index, pd.MultiIndex):
+            panel = panel.reset_index()
+        weights_df = panel[["date", "id", "index_weight"]].drop_duplicates()
+
+        # Merge weights into combined
+        combined = combined.merge(weights_df, on=["date", "id"], how="left")
+        combined["index_weight"] = combined["index_weight"].fillna(0.0)
+
+        # Compute both simple and weighted means
+        def compute_weighted_loss(df):
+            """Compute index-weighted loss by aggregating to date level first"""
+            # Normalize weights per date
+            df["w_norm"] = df.groupby("date")["index_weight"].transform(
+                lambda x: x / (x.sum() + 1e-12)
+            )
+            # Date-level weighted mean
+            date_losses = (df.groupby("date")
+                            .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
+                            .values)
+            return float(np.mean(date_losses))
+
         summary = (
             combined.groupby("baseline")
-                    .agg(mean_loss=("loss","mean"),
-                         cov_rate=("covered","mean"),
-                         mean_width=("width","mean"),
-                         mean_loss_scaled=("loss_scaled","mean"),
-                         mean_width_scaled=("width_scaled","mean"),
-                         n_predictions=("loss","count"))
+                    .agg(
+                        mean_loss_simple=("loss_scaled", "mean"),  # For reference
+                        mean_loss_weighted=("loss_scaled", compute_weighted_loss),  # PRIMARY
+                        cov_rate=("covered", "mean"),
+                        mean_width_scaled=("width_scaled", "mean"),
+                        n_predictions=("loss", "count")
+                    )
                     .reset_index()
-                    .sort_values("mean_loss_scaled")  # Sort by performance (scaled)
+                    .sort_values("mean_loss_weighted")  # Sort by weighted
         )
+
+        # Rename for clarity
+        summary = summary.rename(columns={"mean_loss_weighted": "mean_loss_scaled"})
     summary.to_csv(os.path.join(results_dir, "baseline_summary_securities.csv"), index=False)
 
     # ==================== ENHANCED REPORTING ==================== #
     
     print("\n" + "="*70)
-    print("BASELINE SUMMARY (sorted by scaled loss, ↓ better)")
+    print("BASELINE SUMMARY (sorted by INDEX-WEIGHTED loss, ↓ better)")
     print("="*70)
     print(summary[["baseline", "mean_loss_scaled", "cov_rate", "mean_width_scaled", "n_predictions"]].to_string(index=False))
     

@@ -79,6 +79,8 @@ def load_panel(panel_path: str) -> pd.DataFrame:
         df = pd.read_parquet(panel_path)
     elif panel_path.endswith(".csv"):
         df = pd.read_csv(panel_path, parse_dates=[DATE_COL])
+    elif panel_path.endswith(".pkl"):
+        df = pd.read_pickle(panel_path)
     else:
         raise ValueError(f"Unsupported panel format: {panel_path}")
 
@@ -1017,13 +1019,43 @@ def run_bandit(cfg: dict | Any) -> None:
         json.dump(falsif, f, indent=2)
     print(f"[CRL] Saved: {paths['falsif']}")
     
-    # Print summary
+    # Print summary with index-weighted aggregation
     if not sec_df.empty:
         print(f"\n[CRL] === RESULTS ===")
         print(f"Coverage: {sec_df['covered'].mean():.3f}")
-        print(f"Mean loss (scaled): {sec_df['loss_scaled'].mean():.6f}")
+        
+        # Index-weighted loss (aggregate to date level first)
+        # Load panel for weights if not already in sec_df
+        if "index_weight" not in sec_df.columns:
+            panel = load_panel(panel_path)
+            if isinstance(panel.index, pd.MultiIndex):
+                panel = panel.reset_index()
+            sec_df = sec_df.merge(
+                panel[["date", "id", "index_weight"]].drop_duplicates(),
+                left_on=["date", ID_COL],
+                right_on=["date", "id"],
+                how="left"
+            )
+            sec_df["index_weight"] = sec_df["index_weight"].fillna(0.0)
+        
+        # Normalize weights within each date, then compute weighted mean per date
+        sec_df["w_norm"] = sec_df.groupby("date")["index_weight"].transform(
+            lambda x: x / (x.sum() + 1e-12)
+        )
+        
+        # Date-level weighted aggregation
+        date_losses = (sec_df.groupby("date")
+                            .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
+                            .values)
+        weighted_loss = float(np.mean(date_losses))
+        
+        print(f"Mean loss (index-weighted): {weighted_loss:.6f}")
+        print(f"Mean loss (simple avg): {sec_df['loss_scaled'].mean():.6f}")
         print(f"Predictions: {len(sec_df)} across {sec_df[ID_COL].nunique()} securities")
-        print(f"[CRL] Done.")
+        print(f"[CRL] Using index-weighted aggregation for performance reporting")
+        # Add to summary dict
+        summary["overall_mean_loss_weighted"] = float(weighted_loss)
+        summary["overall_mean_loss_simple"] = float(sec_df["loss_scaled"].mean())
     else:
         print("[CRL] WARNING: No predictions generated")
 
