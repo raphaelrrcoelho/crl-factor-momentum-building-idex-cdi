@@ -1039,7 +1039,7 @@ def run_bandit(cfg: dict | Any) -> None:
             sec_df["index_weight"] = sec_df["index_weight"].fillna(0.0)
         
         # Normalize weights within each date, then compute weighted mean per date
-        sec_df["w_norm"] = sec_df.groupby("date")["index_weight"].transform(
+        sec_df["w_norm"] = sec_df.groupby(["date", "h"])["index_weight"].transform(
             lambda x: x / (x.sum() + 1e-12)
         )
         

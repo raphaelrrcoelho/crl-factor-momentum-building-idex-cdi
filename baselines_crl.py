@@ -499,34 +499,41 @@ def run_all_baselines(
         combined = combined.merge(weights_df, on=["date", "id"], how="left")
         combined["index_weight"] = combined["index_weight"].fillna(0.0)
 
-        # Compute both simple and weighted means
-        def compute_weighted_loss(df):
-            """Compute index-weighted loss by aggregating to date level first"""
-            # Normalize weights per date
-            df["w_norm"] = df.groupby("date")["index_weight"].transform(
-                lambda x: x / (x.sum() + 1e-12)
-            )
-            # Date-level weighted mean
-            date_losses = (df.groupby("date")
-                            .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
-                            .values)
-            return float(np.mean(date_losses))
-
-        summary = (
-            combined.groupby("baseline")
-                    .agg(
-                        mean_loss_simple=("loss_scaled", "mean"),  # For reference
-                        mean_loss_weighted=("loss_scaled", compute_weighted_loss),  # PRIMARY
-                        cov_rate=("covered", "mean"),
-                        mean_width_scaled=("width_scaled", "mean"),
-                        n_predictions=("loss", "count")
-                    )
-                    .reset_index()
-                    .sort_values("mean_loss_weighted")  # Sort by weighted
+        # Compute index-weighted loss for each baseline BEFORE groupby
+        # Step 1: Normalize weights per (date, h) within each baseline
+        combined["w_norm"] = combined.groupby(["baseline", "date", "h"])["index_weight"].transform(
+            lambda x: x / (x.sum() + 1e-12)
         )
 
-        # Rename for clarity
+        # Step 2: Compute weighted mean per (baseline, date, h)
+        weighted_by_date = (combined.groupby(["baseline", "date", "h"])
+                                    .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
+                                    .reset_index()
+                                    .rename(columns={0: "loss_weighted"}))
+
+        # Step 3: Average across dates per baseline (this is our final weighted loss)
+        weighted_summary = (weighted_by_date.groupby("baseline")
+                                           .agg(mean_loss_weighted=("loss_weighted", "mean"))
+                                           .reset_index())
+
+        # Also compute simple averages for comparison
+        simple_summary = (combined.groupby("baseline")
+                                  .agg(
+                                      mean_loss_simple=("loss_scaled", "mean"),
+                                      cov_rate=("covered", "mean"),
+                                      mean_width_scaled=("width_scaled", "mean"),
+                                      n_predictions=("loss", "count")
+                                  )
+                                  .reset_index())
+
+        # Merge weighted and simple summaries
+        summary = simple_summary.merge(weighted_summary, on="baseline", how="left")
+
+        # Reorder columns and use weighted as primary
+        summary = summary[["baseline", "mean_loss_weighted", "mean_loss_simple", 
+                           "cov_rate", "mean_width_scaled", "n_predictions"]]
         summary = summary.rename(columns={"mean_loss_weighted": "mean_loss_scaled"})
+        summary = summary.sort_values("mean_loss_scaled")
     summary.to_csv(os.path.join(results_dir, "baseline_summary_securities.csv"), index=False)
 
     # ==================== ENHANCED REPORTING ==================== #
@@ -534,7 +541,8 @@ def run_all_baselines(
     print("\n" + "="*70)
     print("BASELINE SUMMARY (sorted by INDEX-WEIGHTED loss, ↓ better)")
     print("="*70)
-    print(summary[["baseline", "mean_loss_scaled", "cov_rate", "mean_width_scaled", "n_predictions"]].to_string(index=False))
+    print(summary[["baseline", "mean_loss_scaled", "mean_loss_simple", "cov_rate", 
+                   "mean_width_scaled", "n_predictions"]].to_string(index=False))
     
     # Identify best performers
     if not summary.empty:
@@ -542,14 +550,20 @@ def run_all_baselines(
         fixed_only = summary[summary["baseline"].str.startswith("fixed_")]
         
         if not random_perf.empty:
-            print(f"\n[BASE] Random baseline: loss_scaled={random_perf.iloc[0]['mean_loss_scaled']:.6f}")
+            print(f"\n[BASE] Random baseline: loss_scaled={random_perf.iloc[0]['mean_loss_scaled']:.6f} (weighted)")
         
         if not fixed_only.empty:
             best_fixed = fixed_only.iloc[0]
             worst_fixed = fixed_only.iloc[-1]
-            print(f"[BASE] Best fixed policy: {best_fixed['baseline']} (loss_scaled={best_fixed['mean_loss_scaled']:.6f})")
-            print(f"[BASE] Worst fixed policy: {worst_fixed['baseline']} (loss_scaled={worst_fixed['mean_loss_scaled']:.6f})")
+            print(f"[BASE] Best fixed policy: {best_fixed['baseline']} (loss_scaled={best_fixed['mean_loss_scaled']:.6f}, weighted)")
+            print(f"[BASE] Worst fixed policy: {worst_fixed['baseline']} (loss_scaled={worst_fixed['mean_loss_scaled']:.6f}, weighted)")
             print(f"[BASE] Range across fixed policies: {worst_fixed['mean_loss_scaled'] - best_fixed['mean_loss_scaled']:.6f}")
+            
+            # Show the difference between weighted and simple
+            print(f"\n[BASE] Aggregation method impact:")
+            print(f"  Best fixed (weighted): {best_fixed['mean_loss_scaled']:.6f}")
+            print(f"  Best fixed (simple):   {best_fixed['mean_loss_simple']:.6f}")
+            print(f"  Ratio: {best_fixed['mean_loss_scaled'] / best_fixed['mean_loss_simple']:.2f}x")   
     
     print("="*70)
 

@@ -534,11 +534,30 @@ def compute_statistical_significance(results_dir: str,
     results = []
     
     # Test against each baseline
-    for baseline_name, g in baseline_scores.groupby("baseline"):
-        baseline_daily = (g.groupby("date")["loss_scaled"]
-                          .mean()
-                          .sort_index()
-                          .rename(f"{baseline_name}_loss"))
+    for baseline_name, baseline_data in baseline_scores.groupby("baseline"):
+        # Merge weights into baseline
+        base_sec = baseline_data.copy()
+        if "index_weight" not in base_sec.columns:
+            panel = load_panel(panel_path)
+            if isinstance(panel.index, pd.MultiIndex):
+                panel = panel.reset_index()
+            base_sec = base_sec.merge(
+                panel[["date", "id", "index_weight"]].drop_duplicates(),
+                on=["date", "id"],
+                how="left"
+            )
+            base_sec["index_weight"] = base_sec["index_weight"].fillna(1.0)
+        
+        # Normalize weights per (date, h)
+        base_sec["w_norm"] = base_sec.groupby(["date", "h"])["index_weight"].transform(
+            lambda x: x / (x.sum() + 1e-12)
+        )
+        
+        # Aggregate baseline to date level using index weighting
+        baseline_daily = (base_sec.groupby("date")
+                                  .apply(lambda g: np.average(g["loss_scaled"], weights=g["w_norm"]))
+                                  .sort_index()
+                                  .rename(f"{baseline_name}_loss"))
         
         # Merge on common dates
         merged = pd.concat([crl_daily, baseline_daily], axis=1).dropna()
@@ -580,6 +599,7 @@ def compute_statistical_significance(results_dir: str,
         # Print summary
         print("\n" + "="*70)
         print("STATISTICAL SIGNIFICANCE TESTS (Diebold-Mariano)")
+        print("INDEX-WEIGHTED AGGREGATION")
         print("="*70)
         for _, row in results_df.iterrows():
             sig_marker = "***" if row["significant_1pct"] else ("**" if row["significant_5pct"] else "")
