@@ -297,9 +297,11 @@ def _effective_sample_size(weights: np.ndarray) -> float:
 def compute_ope_dr(results_dir: str,
                    cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    OPE on RETURNS (policy-invariant). Uses CRL-aligned standardized features:
-    momentum *_z, ret_vol20_z, idx_vol_z, spread_z, duration_z.
-    Cross-fitted Q̂ with purged+embargoed date splits (purge = max_h).
+    OPE on RETURNS (policy-invariant) with horizon scaling.
+    
+    NEW: ope_return_scale config option:
+        - "per_step" (default): divide returns by horizon for fair comparison
+        - "raw": use cumulative returns as-is
     """
     cfg = cfg or {}
     _ensure_dir(results_dir)
@@ -308,10 +310,8 @@ def compute_ope_dr(results_dir: str,
     R, E = _align_behavior_and_eval(results_dir)
     print(f"[OPE] Loaded behavior={len(R):,} rows, eval={len(E):,} rows")
 
-    # 2) Load panel and build CRL/Baselines feature table (TRAIN-only standardization)
+    # 2) Load panel and build CRL/Baselines feature table
     panel_path = _cfg_get(cfg, ("panel_path", "data.panel_path"), "data/cdi_processed.pkl")
-    # prepare_security_data computes momentum columns (not used as features), 
-    # context z-scores, cross-sectional features, and forward labels
     panel_full, _ = prepare_security_data(_load_panel(panel_path), cfg)
 
     # 3) Build training/eval dataframe on shared contexts
@@ -319,7 +319,21 @@ def compute_ope_dr(results_dir: str,
     if Rme.empty:
         raise ValueError("No overlapping (date,id) between behavior and evaluation logs.")
 
-    # 4) Feature columns: CRL-aligned z-features
+    # =========================================================================
+    # NEW: Horizon scaling for fair cross-horizon comparison
+    # =========================================================================
+    ope_return_scale = str(_cfg_get(cfg, "ope_return_scale", "per_step")).lower()
+    
+    if ope_return_scale == "per_step":
+        Rme["y_raw"] = Rme["y"].copy()
+        Rme["y"] = Rme["y"] / Rme["h_b"].astype(float)
+        print(f"[OPE] Scaled returns by horizon (per_step mode)")
+    else:
+        Rme["y_raw"] = Rme["y"].copy()
+        print(f"[OPE] Using raw returns (no horizon scaling)")
+    # =========================================================================
+
+    # 4) Feature columns
     base_z = [c for c in ["ret_vol20_z", "idx_vol_z", "spread_z", "duration_z", "ret_autocorr_z"] 
               if c in panel_full.columns]
     percentile_feats = [c for c in ["spread_percentile", "vol_percentile"] 

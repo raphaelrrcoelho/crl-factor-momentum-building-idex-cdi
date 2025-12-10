@@ -192,6 +192,7 @@ def plot_rolling_coverage(scores_idx: pd.DataFrame, out_dir: str, window: int = 
     ax.set_ylim(0, 1.0)
     ax.set_title(f"Rolling coverage (index-weighted average across securities) (window={window})")
     ax.legend(); ax.grid(True, alpha=0.35)
+    ax.set_ylim(0.70, 1.0)  # Focus on relevant coverage range
     _savefig(fig, os.path.join(out_dir, f"rolling_cov_{window}d.png"))
 
 def plot_timeseries_metric(scores_idx: pd.DataFrame, col: str, out_path: str, ylabel: str):
@@ -878,11 +879,6 @@ def _build_performance_table(results_dir: str, out_dir: str, panel_path: str
             if not crl_row.empty:
                 plot_subset.append(crl_row.iloc[0])
             
-            # Random
-            random_row = perf_sorted[perf_sorted["model"] == "random"]
-            if not random_row.empty:
-                plot_subset.append(random_row.iloc[0])
-            
             # Best 3 fixed
             for i in range(min(3, len(fixed_only))):
                 plot_subset.append(fixed_only.iloc[i])
@@ -944,8 +940,6 @@ def _baseline_analysis(results_dir: str, out_dir: str, perf: Optional[pd.DataFra
              "improvement_vs_best_%": -improvement_vs_best},
             {"policy": f"Worst Fixed ({worst_fixed[col_name]})", "mean_loss": worst_fixed["mean_loss"], 
              "improvement_vs_best_%": -(improvement_vs_worst - improvement_vs_best)},
-            {"policy": "Random (uniform)", "mean_loss": random_loss, 
-             "improvement_vs_best_%": -(improvement_vs_random - improvement_vs_best) if not np.isnan(random_loss) else np.nan},
         ])
         comparison.to_csv(os.path.join(out_dir, "baseline_comparison.csv"), index=False)
         
@@ -1012,14 +1006,33 @@ def _policy_evolution(results_dir: str, out_dir: str):
 
     # Encode categories deterministically
     s = choices["momentum"].astype(str)
-    code_map = {k: i for i, k in enumerate(sorted(s.dropna().unique().tolist()))}
+    sorted_moms = sorted(s.dropna().unique().tolist())
+    code_map = {k: i for i, k in enumerate(sorted_moms)}
     m_code = s.map(code_map).values
-    t = choices["date"].values; h = choices["h"].astype(int).values
+    t = choices["date"].values
+    h = choices["h"].astype(int).values
 
     fig, axs = plt.subplots(2, 1, figsize=(11.5, 5.2), sharex=True)
-    axs[0].plot(t, m_code, linewidth=1.2); axs[0].set_ylabel("Momentum code"); axs[0].grid(True, alpha=0.25)
-    axs[0].set_title("Policy evolution: selected specs over time")
-    axs[1].plot(t, h, linewidth=1.2); axs[1].set_ylabel("Horizon (steps)"); axs[1].grid(True, alpha=0.25); axs[1].set_xlabel("Date")
+    
+    # Top panel: Momentum window selection
+    axs[0].plot(t, m_code, linewidth=1.2)
+    axs[0].set_ylabel("Momentum Window")
+    axs[0].set_yticks(list(range(len(sorted_moms))))
+    # Create readable labels: "mom_w10" -> "10-day", etc.
+    ytick_labels = [m.replace("mom_w", "") + "-day" for m in sorted_moms]
+    axs[0].set_yticklabels(ytick_labels)
+    axs[0].grid(True, alpha=0.25)
+    axs[0].set_title("Policy evolution: selected specifications over time")
+    
+    # Bottom panel: Horizon selection  
+    axs[1].plot(t, h, linewidth=1.2)
+    axs[1].set_ylabel("Forecast Horizon (days)")
+    axs[1].set_yticks([10, 21, 42, 63])
+    axs[1].set_yticklabels(["10-day", "21-day", "42-day", "63-day"])
+    axs[1].grid(True, alpha=0.25)
+    axs[1].set_xlabel("Date")
+    
+    plt.tight_layout()
     _savefig(fig, os.path.join(out_dir, "policy_evolution.png"))
 
     # Save legend mapping
