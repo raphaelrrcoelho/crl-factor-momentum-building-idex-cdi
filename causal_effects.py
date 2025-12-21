@@ -46,6 +46,8 @@ from baselines_crl import prepare_security_data
 from ablation_study import _newey_west_se, _mbb_mean_ci
 from utils_timesplit import PurgedTimeSeriesSplit  # purged+embargoed cross-fitting
 
+from falsification_tests import add_falsification_to_causal_effects
+
 DATE_COL = "date"
 ID_COL   = "id"
 
@@ -660,6 +662,10 @@ def run_causal_effects(cfg: dict | Any):
         "value_function": value_res,
         "alignment": align_res,
     }
+
+    falsif_results = add_falsification_to_causal_effects(df, choices, cfg, results_dir)
+    summary["falsification"] = falsif_results
+    
     with open(os.path.join(results_dir, "causal_effects_meta.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
